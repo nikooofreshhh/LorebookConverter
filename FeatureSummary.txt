@@ -1,0 +1,20 @@
+Lorebook Converter – Feature Summary
+
+Core Workflow
+- Import lorebook JSON by upload or paste.
+- Auto-detect format (SillyTavern or DreamJourney) with manual override.
+- Reorder entries (move up/down, move to position, bulk reorder).
+- Cascade cleanup with edge inspection and highlighted triggers.
+- Snip keys per target or snip all targets from a parent.
+- Quick edit entry description and keys with preview.
+- Export to SillyTavern or DreamJourney.
+- Reset tools: reset snips, reset edits, reset order, or reset all.
+
+Export Outputs
+- SillyTavern: dictionary of entries with full metadata.
+- DreamJourney: list of entries with name/description/keys/type plus lorebook metadata.
+
+Usability
+- Maintains working state across reruns for iterative edits.
+- Clear or reset state between imports.
+- Sample files included in samples/.
