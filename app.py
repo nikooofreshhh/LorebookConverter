@@ -698,9 +698,13 @@ def main():
 
     st.sidebar.markdown("---")
     st.sidebar.markdown("## Reset All Changes (Can't Be Undone!!)")
+    confirm_reset = st.sidebar.checkbox("Confirm reset", value=False, key="reset_all_confirm")
     if st.sidebar.button("Reset all", key="sidebar_reset_all"):
-        reset_all_changes(len(entries))
-        st.rerun()
+        if not confirm_reset:
+            st.sidebar.warning("Please confirm reset before proceeding.")
+        else:
+            reset_all_changes(len(entries))
+            st.rerun()
 
     st.header("Cascade Cleanup")
     if not entries:
@@ -950,13 +954,17 @@ def main():
                                         trig_key = f"edit_update_trigger_{v}"
                                         st.session_state[trig_key] = ", ".join([k for k in current_keys if k not in sn])
                                     st.rerun()
+                    confirm_snip_all = st.checkbox("Confirm snip all", value=False, key=f"snip_all_confirm_{u}")
                     if st.button("Snip all from this parent- WARNING, deletes ALL keys mentioned in this entry from child key lists!!", key=f"snip_all_{u}"):
-                        for (_, v, keys) in children:
-                            if v not in st.session_state.snipped_keys:
-                                st.session_state.snipped_keys[v] = set()
-                            st.session_state.snipped_keys[v].update(keys)
-                        st.success(f"Snipped all {len(children)} target(s) from parent {u}.")
-                        st.rerun()
+                        if not confirm_snip_all:
+                            st.warning("Please confirm snip all before proceeding.")
+                        else:
+                            for (_, v, keys) in children:
+                                if v not in st.session_state.snipped_keys:
+                                    st.session_state.snipped_keys[v] = set()
+                                st.session_state.snipped_keys[v].update(keys)
+                            st.success(f"Snipped all {len(children)} target(s) from parent {u}.")
+                            st.rerun()
 
 
 if __name__ == '__main__':
