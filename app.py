@@ -363,6 +363,24 @@ def _parse_keys_csv(keys_text: str) -> List[Dict[str, str]]:
     return [{"keyText": k} for k in keys]
 
 
+def _load_uploaded_json(uploaded: Any) -> Any:
+    """Load JSON from Streamlit UploadedFile in a cloud-safe way."""
+    if uploaded is None:
+        return None
+    try:
+        raw = uploaded.getvalue()
+        if isinstance(raw, bytes):
+            # Handle UTF-8 with optional BOM
+            text = raw.decode("utf-8-sig")
+            return json.loads(text)
+        if isinstance(raw, str):
+            return json.loads(raw)
+    except Exception:
+        pass
+    # Fallback to file-like interface
+    return json.load(uploaded)
+
+
 def main():
     st.set_page_config(page_title="Niko's Lorebook Tool", layout="wide")
     st.title("Lorebook Tool")
@@ -401,7 +419,7 @@ def main():
     use_session_entries = st.session_state.get("use_session_entries", False)
     if uploaded is not None:
         try:
-            data = json.load(uploaded)
+            data = _load_uploaded_json(uploaded)
         except Exception as e:
             st.error(f"Could not parse uploaded JSON: {e}")
             return
