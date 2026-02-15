@@ -174,7 +174,8 @@ def reset_state_for_new_import() -> None:
         "reorder_show_bulk",
         "pasted_to_import",
         "pasted_text_area",
-        "file_uploader"
+        "file_uploader",
+        "undo_stack"
     ]
     keys = list(st.session_state.keys())
     for k in keys:
@@ -189,6 +190,7 @@ def reset_state_for_new_import() -> None:
 
 def reset_all_changes(entries_len: int) -> None:
     """Reset snips, order, and edits back to the original imported entries."""
+    st.session_state.undo_stack = []
     st.session_state.snipped_keys = {}
     imported = st.session_state.get("entries_imported")
     if imported is not None:
@@ -209,6 +211,20 @@ def reset_all_changes(entries_len: int) -> None:
                 del st.session_state[k]
             except Exception:
                 pass
+
+
+def push_undo() -> None:
+    """Snapshot current mutable state onto the undo stack."""
+    snapshot = {
+        "entries_work": deepcopy(st.session_state.get("entries_work", [])),
+        "entries_original": deepcopy(st.session_state.get("entries_original", [])),
+        "snipped_keys": deepcopy(st.session_state.get("snipped_keys", {})),
+        "order": list(st.session_state.get("order", [])),
+        "initial_order": list(st.session_state.get("initial_order", [])),
+    }
+    stack = st.session_state.get("undo_stack", [])
+    stack.append(snapshot)
+    st.session_state.undo_stack = stack[-20:]  # cap at 20
 
 
 def detect_format(raw_entries: Any) -> str:
@@ -378,12 +394,6 @@ def main():
             st.session_state['pasted_to_import'] = pasted
             st.rerun()
     with btn_col_2:
-        st.button("Clear pasted JSON", key="clear_pasted_btn", on_click=clear_text_box, args=("pasted_text_area",))
-    with btn_col_3:
-        if st.button("New Import (clear state after prior import)", key="new_import_btn"):
-            reset_state_for_new_import()
-            st.rerun()
-    with btn_col_4:
         if st.button("Start from blank", key="start_from_blank_btn"):
             reset_state_for_new_import()
             st.session_state.use_session_entries = True
@@ -394,6 +404,12 @@ def main():
             st.session_state.initial_order = []
             st.session_state.initial_order_imported = []
             st.session_state.order = []
+            st.rerun()
+    with btn_col_3:
+        st.button("Clear pasted JSON", key="clear_pasted_btn", on_click=clear_text_box, args=("pasted_text_area",))
+    with btn_col_4:
+        if st.button("New Import (clear state after prior import)", key="new_import_btn"):
+            reset_state_for_new_import()
             st.rerun()
 
     # Determine which source to parse: uploaded file or previously-stashed pasted text
@@ -468,6 +484,8 @@ def main():
     # session state
     if "snipped_keys" not in st.session_state:
         st.session_state.snipped_keys = {}  # {entry_idx: set(keys)}
+    if "undo_stack" not in st.session_state:
+        st.session_state.undo_stack = []
 
     # Reorder UI: maintain an `order` mapping (output position -> source index)
     if "initial_order" not in st.session_state or len(st.session_state.get("initial_order", [])) != len(entries):
@@ -483,7 +501,7 @@ def main():
             new_name = st.text_input("Name", value="")
             new_desc = st.text_area("Description", value="", height=140)
             new_keys = st.text_area("Keys (comma or newline separated)", value="", height=80)
-            new_type = st.selectbox("Type", ["character", "object", "plot", "other"], index=3)
+            new_type = st.selectbox("Type (for DreamJourney)", ["character", "object", "plot", "other"], index=3)
             position_value = st.number_input(
                 "Position (1 = top)",
                 min_value=1,
@@ -497,6 +515,7 @@ def main():
             if not new_name and not new_desc and not new_keys:
                 st.warning("Please provide at least a name, description, or key before adding.")
             else:
+                push_undo()
                 current_order = st.session_state.get("order", list(range(len(entries))))
                 current_initial = st.session_state.get("initial_order", list(range(len(entries))))
                 entry_obj = {
@@ -531,6 +550,7 @@ def main():
                 if not confirm_delete:
                     st.warning("Please confirm delete before proceeding.")
                 else:
+                    push_undo()
                     st.session_state.entries_work.pop(delete_idx)
                     if "entries_original" in st.session_state and len(st.session_state.entries_original) > delete_idx:
                         st.session_state.entries_original.pop(delete_idx)
@@ -577,6 +597,7 @@ def main():
             with cols[0]:
                 if st.button("Move Up", key="reorder_move_up"):
                     if sel_pos > 0:
+                        push_undo()
                         o = st.session_state.order
                         o[sel_pos - 1], o[sel_pos] = o[sel_pos], o[sel_pos - 1]
                         st.session_state.order = o
@@ -584,6 +605,7 @@ def main():
             with cols[1]:
                 if st.button("Move Down", key="reorder_move_down"):
                     if sel_pos < len(st.session_state.order) - 1:
+                        push_undo()
                         o = st.session_state.order
                         o[sel_pos + 1], o[sel_pos] = o[sel_pos], o[sel_pos + 1]
                         st.session_state.order = o
@@ -591,6 +613,7 @@ def main():
             with cols[2]:
                 new_pos = st.number_input("Move to position (1 = top)", min_value=1, max_value=len(entries), value=sel_pos + 1, step=1, key="reorder_move_to_pos")
                 if st.button("Apply Move", key="reorder_apply_move"):
+                    push_undo()
                     cur = [x for x in st.session_state.order if x != sel_idx]
                     insert_at = max(0, min(len(cur), new_pos - 1))
                     cur.insert(insert_at, sel_idx)
@@ -603,10 +626,12 @@ def main():
             cols_top = st.columns([1, 1])
             with cols_top[0]:
                 if st.button("Reset order", key="reorder_reset_order"):
+                    push_undo()
                     st.session_state.order = st.session_state.get("initial_order", list(range(len(entries))))
                     st.rerun()
             with cols_top[1]:
                 if st.button("Reverse order", key="reorder_reverse_order"):
+                    push_undo()
                     st.session_state.order = list(reversed(st.session_state.get("order", list(range(len(entries))))))
                     st.rerun()
 
@@ -627,6 +652,7 @@ def main():
                     with cols_list[3]:
                         if st.button("↑", key=f"quick_move_up_{pos}", help="Move up"):
                             if pos > 0:
+                                push_undo()
                                 o = st.session_state.order
                                 o[pos - 1], o[pos] = o[pos], o[pos - 1]
                                 st.session_state.order = o
@@ -634,6 +660,7 @@ def main():
                     with cols_list[4]:
                         if st.button("↓", key=f"quick_move_down_{pos}", help="Move down"):
                             if pos < len(st.session_state.order) - 1:
+                                push_undo()
                                 o = st.session_state.order
                                 o[pos + 1], o[pos] = o[pos], o[pos + 1]
                                 st.session_state.order = o
@@ -662,6 +689,7 @@ def main():
                                     ok = False
                                     break
                         if ok:
+                            push_undo()
                             st.session_state.order = parsed
                             st.rerun()
 
@@ -706,6 +734,19 @@ def main():
             reset_all_changes(len(entries))
             st.rerun()
 
+    st.sidebar.markdown("---")
+    if st.session_state.get("undo_stack"):
+        if st.sidebar.button(f"Undo last action ({len(st.session_state.undo_stack)} in history)", key="sidebar_undo"):
+            snapshot = st.session_state.undo_stack.pop()
+            st.session_state.entries_work = snapshot["entries_work"]
+            st.session_state.entries_original = snapshot["entries_original"]
+            st.session_state.snipped_keys = snapshot["snipped_keys"]
+            st.session_state.order = snapshot["order"]
+            st.session_state.initial_order = snapshot["initial_order"]
+            st.rerun()
+    else:
+        st.sidebar.button("Undo last action (nothing to undo)", key="sidebar_undo_disabled", disabled=True)
+
     st.header("Cascade Cleanup")
     if not entries:
         st.info("No entries to analyze for cascade cleanup.")
@@ -732,9 +773,11 @@ def main():
         # Reset snips button specific to this section
         col_reset_snips, col_reset_edits = st.columns([1, 1])
         if col_reset_snips.button("Reset snips", key="cascade_reset_snips"):
+            push_undo()
             st.session_state.snipped_keys = {}
             st.rerun()
         if col_reset_edits.button("Reset edits", key="cascade_reset_edits"):
+            push_undo()
             # Restore edited entries to original values and clear edit UI state
             if "entries_original" in st.session_state:
                 st.session_state.entries_work = deepcopy(st.session_state.entries_original)
@@ -831,6 +874,7 @@ def main():
 
             col_save, col_update, col_cancel = st.columns([1, 1, 1])
             if col_save.button("Save", key=f"save_edit_{trace_idx}"):
+                push_undo()
                 # persist description and keys
                 st.session_state['entries_work'][trace_idx]['description'] = new_text
                 # parse CSV into list of keys
@@ -905,19 +949,21 @@ def main():
                     else:
                         st.write(child_desc)
 
-        # Key snipping UI collapsed by default
-        with st.expander(f"Key snipping ({len(display_edges)} connections, {total_edges} total keys mentioned in other entries)", expanded=False):
+        # Key snipping UI collapsed by default, stays open if a snip action was just performed
+        _snip_section_open = st.session_state.get("snip_open_parent") is not None
+        with st.expander(f"Key snipping ({len(display_edges)} connections, {total_edges} total keys mentioned in other entries)", expanded=_snip_section_open):
             st.markdown("Select connections to snip. Connections are snipped by removing the offending key from the child entry's key list. Expand a parent to see its outgoing connections.")
             for u in [idx for idx in display_order if idx in parent_map]:
                 children = parent_map[u]
                 label = f"{u}. {entries[u].get('name','(no name)')} — {len(children)} target(s)"
-                with st.expander(label, expanded=False):
+                _parent_open = (st.session_state.get("snip_open_parent") == u)
+                with st.expander(label, expanded=_parent_open):
                     st.markdown("**Targets**")
 
                     for uu, v, keys in children:
                         child_label = f"{v}. {entries[v].get('name','(no name)')} — {len(keys)} key(s)"
-                        # each child expander starts collapsed
-                        with st.expander(child_label, expanded=False):
+                        _child_open = (st.session_state.get("snip_open_parent") == uu and st.session_state.get("snip_open_child") == v)
+                        with st.expander(child_label, expanded=_child_open):
                             # show keys with individual checkboxes
                             key_check_ids: List[str] = []
                             for i, key in enumerate(keys):
@@ -935,6 +981,7 @@ def main():
                                     if st.session_state.get(chk_id, False):
                                         selected.append(key)
                                 if selected:
+                                    push_undo()
                                     if v not in st.session_state.snipped_keys:
                                         st.session_state.snipped_keys[v] = set()
                                     st.session_state.snipped_keys[v].update(selected)
@@ -953,18 +1000,26 @@ def main():
                                         sn = st.session_state.get('snipped_keys', {}).get(v, set())
                                         trig_key = f"edit_update_trigger_{v}"
                                         st.session_state[trig_key] = ", ".join([k for k in current_keys if k not in sn])
+                                    st.session_state.snip_open_parent = uu
+                                    st.session_state.snip_open_child = v
                                     st.rerun()
                     confirm_snip_all = st.checkbox("Confirm snip all", value=False, key=f"snip_all_confirm_{u}")
                     if st.button("Snip all from this parent- WARNING, deletes ALL keys mentioned in this entry from child key lists!!", key=f"snip_all_{u}"):
                         if not confirm_snip_all:
                             st.warning("Please confirm snip all before proceeding.")
                         else:
+                            push_undo()
                             for (_, v, keys) in children:
                                 if v not in st.session_state.snipped_keys:
                                     st.session_state.snipped_keys[v] = set()
                                 st.session_state.snipped_keys[v].update(keys)
                             st.success(f"Snipped all {len(children)} target(s) from parent {u}.")
+                            st.session_state.snip_open_parent = u
+                            st.session_state.pop("snip_open_child", None)
                             st.rerun()
+        # Clear snip-open tracking so expanders return to default on the next non-snip action
+        st.session_state.pop("snip_open_parent", None)
+        st.session_state.pop("snip_open_child", None)
 
 
 if __name__ == '__main__':
