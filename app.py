@@ -157,9 +157,13 @@ def reset_state_for_new_import() -> None:
     """Clear session state keys that should not persist across imports."""
     to_clear_prefixes = [
         "entries_original",
+        "entries_imported",
         "entries_work",
         "snipped_keys",
         "order",
+        "initial_order",
+        "initial_order_imported",
+        "use_session_entries",
         "inspect_selected",
         "editing_idx",
         "edit_keys_csv_",
@@ -186,9 +190,17 @@ def reset_state_for_new_import() -> None:
 def reset_all_changes(entries_len: int) -> None:
     """Reset snips, order, and edits back to the original imported entries."""
     st.session_state.snipped_keys = {}
-    st.session_state.order = list(range(entries_len))
-    if "entries_original" in st.session_state:
-        st.session_state.entries_work = deepcopy(st.session_state.entries_original)
+    imported = st.session_state.get("entries_imported")
+    if imported is not None:
+        st.session_state.entries_original = deepcopy(imported)
+        st.session_state.entries_work = deepcopy(imported)
+        entries_len = len(imported)
+    st.session_state.initial_order = _reconcile_order(
+        st.session_state.get("initial_order_imported", list(range(entries_len))),
+        entries_len,
+    )
+    st.session_state.order = st.session_state.initial_order
+    st.session_state.use_session_entries = True
     if "editing_idx" in st.session_state:
         del st.session_state["editing_idx"]
     for k in list(st.session_state.keys()):
@@ -251,6 +263,46 @@ def normalize_entries(raw_entries: Any, detected_format: str) -> List[Dict[str, 
     return [normalize_entry(e, detected_format) for e in entries_list]
 
 
+def _safe_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _reconcile_order(order_list: List[int], entries_len: int) -> List[int]:
+    """Ensure order list contains each index 0..entries_len-1 exactly once, preserving existing order."""
+    seen: Set[int] = set()
+    cleaned: List[int] = []
+    for idx in order_list:
+        if isinstance(idx, int) and 0 <= idx < entries_len and idx not in seen:
+            cleaned.append(idx)
+            seen.add(idx)
+    for idx in range(entries_len):
+        if idx not in seen:
+            cleaned.append(idx)
+    return cleaned
+
+
+def build_initial_order(raw_entries: Any, detected_format: str) -> List[int]:
+    """Build initial order mapping (output position -> source index) for import."""
+    if isinstance(raw_entries, dict):
+        entries_list = list(raw_entries.values())
+    else:
+        entries_list = raw_entries if isinstance(raw_entries, list) else []
+
+    if detected_format != "SillyTavern":
+        return list(range(len(entries_list)))
+
+    keyed_indices: List[Tuple[int, Tuple[int, int]]] = []
+    for idx, entry in enumerate(entries_list):
+        order_value = _safe_int(entry.get("order"), idx)
+        keyed_indices.append((idx, (order_value, idx)))
+
+    keyed_indices.sort(key=lambda item: item[1])
+    return [idx for idx, _ in keyed_indices]
+
+
 def export_to_format(entries_work: List[Dict[str, Any]], snipped_keys: Dict[int, Set[str]], order: List[int], export_format: str, lorebook_name: str) -> Dict[str, Any]:
     """Export entries in the specified format (SillyTavern or DreamJourney)."""
     exported_entries: Dict[str, Any] = {}
@@ -306,6 +358,11 @@ def clear_text_box(key: str) -> None:
             pass
 
 
+def _parse_keys_csv(keys_text: str) -> List[Dict[str, str]]:
+    keys = [k.strip() for k in re.split(r"[,\n]", keys_text) if k.strip()]
+    return [{"keyText": k} for k in keys]
+
+
 def main():
     st.set_page_config(page_title="Niko's Lorebook Tool", layout="wide")
     st.title("Lorebook Tool")
@@ -315,7 +372,7 @@ def main():
     pasted = st.text_area("Or paste source JSON", value="", height=120,key="pasted_text_area")
 
     # Only import pasted text when the user clicks the button
-    btn_col_1, btn_col_2, btn_col_3 = st.columns([1, 1, 2])
+    btn_col_1, btn_col_2, btn_col_3, btn_col_4 = st.columns([1, 1, 2, 2])
     with btn_col_1:
         if st.button("Import pasted JSON", key="import_pasted_btn"):
             st.session_state['pasted_to_import'] = pasted
@@ -326,9 +383,22 @@ def main():
         if st.button("New Import (clear state after prior import)", key="new_import_btn"):
             reset_state_for_new_import()
             st.rerun()
+    with btn_col_4:
+        if st.button("Start from blank", key="start_from_blank_btn"):
+            reset_state_for_new_import()
+            st.session_state.use_session_entries = True
+            st.session_state.entries_original = []
+            st.session_state.entries_imported = []
+            st.session_state.entries_work = []
+            st.session_state.snipped_keys = {}
+            st.session_state.initial_order = []
+            st.session_state.initial_order_imported = []
+            st.session_state.order = []
+            st.rerun()
 
     # Determine which source to parse: uploaded file or previously-stashed pasted text
     data = None
+    use_session_entries = st.session_state.get("use_session_entries", False)
     if uploaded is not None:
         try:
             data = json.load(uploaded)
@@ -341,6 +411,8 @@ def main():
         except Exception as e:
             st.error(f"Could not parse pasted JSON: {e}")
             return
+    elif use_session_entries:
+        data = {"entries": []}
     else:
         st.info("Upload a file or paste JSON and click 'Import pasted JSON' to begin.")
         return
@@ -370,108 +442,238 @@ def main():
     )
 
     # Normalize entries to universal internal format
-    entries = normalize_entries(raw_entries, import_format)
+    if use_session_entries and "entries_work" in st.session_state:
+        entries = st.session_state["entries_work"]
+        if "initial_order" not in st.session_state or len(st.session_state.get("initial_order", [])) != len(entries):
+            base_initial = st.session_state.get("initial_order", st.session_state.get("order", list(range(len(entries)))))
+            st.session_state.initial_order = _reconcile_order(base_initial, len(entries))
+    else:
+        entries = normalize_entries(raw_entries, import_format)
+        initial_order = build_initial_order(raw_entries, import_format)
 
-    if not entries:
-        st.error("No entries found in JSON.")
-        return
+        # keep a mutable copy of entries in session state so edits persist across reruns
+        if "entries_original" not in st.session_state or len(st.session_state.get("entries_original", [])) != len(entries):
+            st.session_state["entries_original"] = deepcopy(entries)
+        if "entries_imported" not in st.session_state or len(st.session_state.get("entries_imported", [])) != len(entries):
+            st.session_state["entries_imported"] = deepcopy(entries)
+        if "entries_work" not in st.session_state or len(st.session_state.get("entries_work", [])) != len(entries):
+            st.session_state["entries_work"] = deepcopy(entries)
+        entries = st.session_state["entries_work"]
 
-    # keep a mutable copy of entries in session state so edits persist across reruns
-    if "entries_original" not in st.session_state or len(st.session_state.get("entries_original", [])) != len(entries):
-        st.session_state["entries_original"] = deepcopy(entries)
-    if "entries_work" not in st.session_state or len(st.session_state.get("entries_work", [])) != len(entries):
-        st.session_state["entries_work"] = deepcopy(entries)
-    entries = st.session_state["entries_work"]
+        if "initial_order" not in st.session_state or len(st.session_state.get("initial_order", [])) != len(entries):
+            st.session_state.initial_order = initial_order
+        if "initial_order_imported" not in st.session_state or len(st.session_state.get("initial_order_imported", [])) != len(entries):
+            st.session_state.initial_order_imported = initial_order
 
     # session state
     if "snipped_keys" not in st.session_state:
         st.session_state.snipped_keys = {}  # {entry_idx: set(keys)}
 
     # Reorder UI: maintain an `order` mapping (output position -> source index)
+    if "initial_order" not in st.session_state or len(st.session_state.get("initial_order", [])) != len(entries):
+        st.session_state.initial_order = _reconcile_order(st.session_state.get("initial_order", list(range(len(entries)))), len(entries))
     if "order" not in st.session_state or len(st.session_state.get("order", [])) != len(entries):
-        st.session_state.order = list(range(len(entries)))
+        st.session_state.order = _reconcile_order(st.session_state.get("order", st.session_state.initial_order), len(entries))
+
+    display_order = st.session_state.get("order", list(range(len(entries))))
+
+    st.header("Add/Delete Entry")
+    with st.expander("Add a new entry", expanded=False):
+        with st.form("add_entry_form", clear_on_submit=True):
+            new_name = st.text_input("Name", value="")
+            new_desc = st.text_area("Description", value="", height=140)
+            new_keys = st.text_area("Keys (comma or newline separated)", value="", height=80)
+            new_type = st.selectbox("Type", ["character", "object", "plot", "other"], index=3)
+            position_value = st.number_input(
+                "Position (1 = top)",
+                min_value=1,
+                max_value=len(entries) + 1,
+                value=len(entries) + 1,
+                step=1,
+            )
+            submitted = st.form_submit_button("Add entry")
+
+        if submitted:
+            if not new_name and not new_desc and not new_keys:
+                st.warning("Please provide at least a name, description, or key before adding.")
+            else:
+                current_order = st.session_state.get("order", list(range(len(entries))))
+                current_initial = st.session_state.get("initial_order", list(range(len(entries))))
+                entry_obj = {
+                    "name": new_name.strip(),
+                    "description": new_desc.strip(),
+                    "keys": _parse_keys_csv(new_keys),
+                    "type": new_type,
+                }
+                st.session_state.entries_original.append(deepcopy(entry_obj))
+                st.session_state.entries_work.append(entry_obj)
+                st.session_state.use_session_entries = True
+
+                new_idx = len(st.session_state.entries_work) - 1
+                insert_at = max(0, min(len(current_order), int(position_value) - 1))
+                current_order.insert(insert_at, new_idx)
+                current_initial.insert(insert_at, new_idx)
+
+                st.session_state.initial_order = current_initial
+                st.session_state.order = current_order
+                st.rerun()
+
+    with st.expander("Delete an entry", expanded=False):
+        if not entries:
+            st.info("No entries to delete.")
+        else:
+            delete_options = [f"{pos + 1}. {entries[idx].get('name','(no name)')}" for pos, idx in enumerate(display_order)]
+            delete_choice = st.selectbox("Select entry to delete", delete_options, index=0, key="delete_entry_select")
+            delete_pos = delete_options.index(delete_choice)
+            delete_idx = display_order[delete_pos]
+            confirm_delete = st.checkbox("Confirm delete", value=False, key="delete_entry_confirm")
+            if st.button("Delete entry", key="delete_entry_btn"):
+                if not confirm_delete:
+                    st.warning("Please confirm delete before proceeding.")
+                else:
+                    st.session_state.entries_work.pop(delete_idx)
+                    if "entries_original" in st.session_state and len(st.session_state.entries_original) > delete_idx:
+                        st.session_state.entries_original.pop(delete_idx)
+
+                    new_snipped = {}
+                    for k, v in st.session_state.get("snipped_keys", {}).items():
+                        if k == delete_idx:
+                            continue
+                        new_snipped[k - 1 if k > delete_idx else k] = v
+                    st.session_state.snipped_keys = new_snipped
+
+                    def _remap_order(order_list: List[int]) -> List[int]:
+                        remapped = []
+                        for idx in order_list:
+                            if idx == delete_idx:
+                                continue
+                            remapped.append(idx - 1 if idx > delete_idx else idx)
+                        return remapped
+
+                    st.session_state.order = _remap_order(st.session_state.get("order", []))
+                    st.session_state.initial_order = _remap_order(st.session_state.get("initial_order", []))
+                    st.session_state.use_session_entries = True
+                    st.rerun()
 
     st.header("Reorder Entries")
     with st.expander("Reorder entries (optional, changes order of entry placement in output)", expanded=False):
-        st.caption("Select an entry, preview it, and use the controls to move it. For bulk edits, paste a new numerical order below.")
+        if not entries:
+            st.info("No entries yet. Add an entry to enable reordering.")
+        else:
+            st.caption("Select an entry, preview it, and use the controls to move it. For bulk edits, paste a new numerical order below.")
 
-        # Display select + preview + controls
-        options_display = [f"{pos+1}. {entries[idx].get('name','(no name)')}" for pos, idx in enumerate(st.session_state.order)]
-        selected = st.selectbox("Select entry to edit order", options_display, index=0, key="reorder_select_entry")
-        sel_pos = options_display.index(selected)
-        sel_idx = st.session_state.order[sel_pos]
+            # Display select + preview + controls
+            options_display = [f"{pos+1}. {entries[idx].get('name','(no name)')}" for pos, idx in enumerate(st.session_state.order)]
+            selected = st.selectbox("Select entry to edit order", options_display, index=0, key="reorder_select_entry")
+            sel_pos = options_display.index(selected)
+            sel_idx = st.session_state.order[sel_pos]
 
-        # Preview description
-        with st.expander("Preview entry description", expanded=False):
-            desc = entries[sel_idx].get("description", "") or ""
-            st.write(desc)
+            # Preview description
+            with st.expander("Preview entry description", expanded=False):
+                desc = entries[sel_idx].get("description", "") or ""
+                st.write(desc)
 
-        cols = st.columns([1, 1, 2])
-        with cols[0]:
-            if st.button("Move Up", key="reorder_move_up"):
-                if sel_pos > 0:
-                    o = st.session_state.order
-                    o[sel_pos - 1], o[sel_pos] = o[sel_pos], o[sel_pos - 1]
-                    st.session_state.order = o
+            cols = st.columns([1, 1, 2])
+            with cols[0]:
+                if st.button("Move Up", key="reorder_move_up"):
+                    if sel_pos > 0:
+                        o = st.session_state.order
+                        o[sel_pos - 1], o[sel_pos] = o[sel_pos], o[sel_pos - 1]
+                        st.session_state.order = o
+                        st.rerun()
+            with cols[1]:
+                if st.button("Move Down", key="reorder_move_down"):
+                    if sel_pos < len(st.session_state.order) - 1:
+                        o = st.session_state.order
+                        o[sel_pos + 1], o[sel_pos] = o[sel_pos], o[sel_pos + 1]
+                        st.session_state.order = o
+                        st.rerun()
+            with cols[2]:
+                new_pos = st.number_input("Move to position (1 = top)", min_value=1, max_value=len(entries), value=sel_pos + 1, step=1, key="reorder_move_to_pos")
+                if st.button("Apply Move", key="reorder_apply_move"):
+                    cur = [x for x in st.session_state.order if x != sel_idx]
+                    insert_at = max(0, min(len(cur), new_pos - 1))
+                    cur.insert(insert_at, sel_idx)
+                    st.session_state.order = cur
                     st.rerun()
-        with cols[1]:
-            if st.button("Move Down", key="reorder_move_down"):
-                if sel_pos < len(st.session_state.order) - 1:
-                    o = st.session_state.order
-                    o[sel_pos + 1], o[sel_pos] = o[sel_pos], o[sel_pos + 1]
-                    st.session_state.order = o
+
+            st.markdown("---")
+
+            # Reset and Reverse buttons at top
+            cols_top = st.columns([1, 1])
+            with cols_top[0]:
+                if st.button("Reset order", key="reorder_reset_order"):
+                    st.session_state.order = st.session_state.get("initial_order", list(range(len(entries))))
                     st.rerun()
-        with cols[2]:
-            new_pos = st.number_input("Move to position (1 = top)", min_value=1, max_value=len(entries), value=sel_pos + 1, step=1, key="reorder_move_to_pos")
-            if st.button("Apply Move", key="reorder_apply_move"):
-                cur = [x for x in st.session_state.order if x != sel_idx]
-                insert_at = max(0, min(len(cur), new_pos - 1))
-                cur.insert(insert_at, sel_idx)
-                st.session_state.order = cur
-                st.rerun()
+            with cols_top[1]:
+                if st.button("Reverse order", key="reorder_reverse_order"):
+                    st.session_state.order = list(reversed(st.session_state.get("order", list(range(len(entries))))))
+                    st.rerun()
 
-        st.markdown("---")
+            st.markdown("---")
 
-        # Bulk reorder: paste lines with either original source indices or exact "N. name" lines as shown above
-        st.markdown("**Bulk reorder**")
-        st.caption("Paste one line per entry in the desired order. Lines can be the displayed 'N. name' strings, or the original source index numbers (0-based).")
-        bulk = st.text_area("Paste new order here", value="", height=120, placeholder="e.g.\n0\n2\n1\n... OR copy the displayed lines exactly")
-        if st.button("Apply bulk order", key="reorder_apply_bulk"):
-            lines = [l.strip() for l in bulk.splitlines() if l.strip()]
-            if len(lines) != len(entries):
-                st.error(f"Bulk list length {len(lines)} doesn't match number of entries {len(entries)}")
-            else:
-                parsed = []
-                ok = True
-                for ln in lines:
-                    if ln.isdigit():
-                        parsed.append(int(ln))
+            # Quick reorder list view (expanded by default)
+            with st.expander("Quick reorder list", expanded=True):
+                st.caption("Click up/down buttons to reorder entries quickly.")
+                for pos, idx in enumerate(st.session_state.order):
+                    entry_name = entries[idx].get('name', '(no name)')
+                    cols_list = st.columns([0.5, 1, 3, 0.5, 0.5])
+                    with cols_list[0]:
+                        st.markdown(f"**{pos+1}**")
+                    with cols_list[1]:
+                        st.markdown(f"`{idx}`")
+                    with cols_list[2]:
+                        st.markdown(entry_name)
+                    with cols_list[3]:
+                        if st.button("↑", key=f"quick_move_up_{pos}", help="Move up"):
+                            if pos > 0:
+                                o = st.session_state.order
+                                o[pos - 1], o[pos] = o[pos], o[pos - 1]
+                                st.session_state.order = o
+                                st.rerun()
+                    with cols_list[4]:
+                        if st.button("↓", key=f"quick_move_down_{pos}", help="Move down"):
+                            if pos < len(st.session_state.order) - 1:
+                                o = st.session_state.order
+                                o[pos + 1], o[pos] = o[pos], o[pos + 1]
+                                st.session_state.order = o
+                                st.rerun()
+
+            # Bulk reorder (collapsed by default)
+            with st.expander("Bulk reorder", expanded=False):
+                st.caption("Paste one line per entry in the desired order. Lines can be the displayed 'N. name' strings, or the original source index numbers (0-based).")
+                bulk = st.text_area("Paste new order here", value="", height=120, placeholder="e.g.\n0\n2\n1\n... OR copy the displayed lines exactly")
+                if st.button("Apply bulk order", key="reorder_apply_bulk"):
+                    lines = [l.strip() for l in bulk.splitlines() if l.strip()]
+                    if len(lines) != len(entries):
+                        st.error(f"Bulk list length {len(lines)} doesn't match number of entries {len(entries)}")
                     else:
-                        try:
-                            idx = options_display.index(ln)
-                            parsed.append(st.session_state.order[idx])
-                        except ValueError:
-                            st.error(f"Could not parse line: '{ln}'")
-                            ok = False
-                            break
-                if ok:
-                    st.session_state.order = parsed
-                    st.rerun()
+                        parsed = []
+                        ok = True
+                        for ln in lines:
+                            if ln.isdigit():
+                                parsed.append(int(ln))
+                            else:
+                                try:
+                                    idx = options_display.index(ln)
+                                    parsed.append(st.session_state.order[idx])
+                                except ValueError:
+                                    st.error(f"Could not parse line: '{ln}'")
+                                    ok = False
+                                    break
+                        if ok:
+                            st.session_state.order = parsed
+                            st.rerun()
 
-        cols2 = st.columns([1, 1])
-        with cols2[0]:
-            if st.button("Reset order", key="reorder_reset_order"):
-                st.session_state.order = list(range(len(entries)))
-                st.rerun()
-        with cols2[1]:
-            if "reorder_show_bulk" not in st.session_state:
-                st.session_state.reorder_show_bulk = False
-            btn_label = "Hide" if st.session_state.reorder_show_bulk else "Show current order in bulk format"
-            if st.button(btn_label, key="reorder_toggle_bulk"):
-                st.session_state.reorder_show_bulk = not st.session_state.reorder_show_bulk
-                st.rerun()
-        if st.session_state.get("reorder_show_bulk", False):
-            st.code("\n".join(str(i) for i in st.session_state.order))
+                if "reorder_show_bulk" not in st.session_state:
+                    st.session_state.reorder_show_bulk = False
+                btn_label = "Hide" if st.session_state.reorder_show_bulk else "Show current order in bulk format"
+                if st.button(btn_label, key="reorder_toggle_bulk"):
+                    st.session_state.reorder_show_bulk = not st.session_state.reorder_show_bulk
+                    st.rerun()
+                if st.session_state.get("reorder_show_bulk", False):
+                    st.code("\n".join(str(i) for i in st.session_state.order))
+
     
     # Move sidebar controls down - put export options first, then actions at the bottom
     st.sidebar.markdown("## Export Settings")
@@ -501,6 +703,9 @@ def main():
         st.rerun()
 
     st.header("Cascade Cleanup")
+    if not entries:
+        st.info("No entries to analyze for cascade cleanup.")
+        return
     edges = build_trigger_edges(entries)
 
     # Build display list excluding edges with all keys already snipped
@@ -540,14 +745,15 @@ def main():
             st.rerun()
         st.subheader("Inspect Entry - Cascades Highlighted")
         st.markdown("Select an entry. Words in the body of the entry that appear in the key list (or body) of other entries will be automatically highlighted and color coded.\n Entries can be edited, or connections can be snipped below.")
-        trace_options = [f"{i}. {entries[i].get('name','(no name)')}" for i in range(len(entries))]
+        trace_options = [f"{pos + 1}. {entries[idx].get('name','(no name)')}" for pos, idx in enumerate(display_order)]
         if "inspect_selected" not in st.session_state:
             st.session_state["inspect_selected"] = trace_options[0]
         # Ensure the selected value is still valid
         if st.session_state["inspect_selected"] not in trace_options:
             st.session_state["inspect_selected"] = trace_options[0]
         trace_selected = st.selectbox("Select entry to inspect", trace_options, key="inspect_selected")
-        trace_idx = int(trace_selected.split('.', 1)[0])
+        trace_pos = trace_options.index(trace_selected)
+        trace_idx = display_order[trace_pos]
         traced_desc = entries[trace_idx].get('description','') or ''
 
         # find outgoing first-level targets from this entry
@@ -698,7 +904,7 @@ def main():
         # Key snipping UI collapsed by default
         with st.expander(f"Key snipping ({len(display_edges)} connections, {total_edges} total keys mentioned in other entries)", expanded=False):
             st.markdown("Select connections to snip. Connections are snipped by removing the offending key from the child entry's key list. Expand a parent to see its outgoing connections.")
-            for u in sorted(parent_map.keys()):
+            for u in [idx for idx in display_order if idx in parent_map]:
                 children = parent_map[u]
                 label = f"{u}. {entries[u].get('name','(no name)')} — {len(children)} target(s)"
                 with st.expander(label, expanded=False):
